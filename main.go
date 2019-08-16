@@ -1,135 +1,252 @@
 package main
 
 import (
-	"crypto/tls"
-	"encoding/base64"
 	"fmt"
-	"io"
-	"io/ioutil"
-	"net"
+	"math/rand"
 	"net/http"
-	"regexp"
-	"strconv"
-	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
+	"github.com/graphql-go/graphql"
+	"github.com/graphql-go/graphql/gqlerrors"
+	"github.com/graphql-go/handler"
 )
 
-const serverAddress = "https://integration.agent.exec.itsupport247.net/agent/v1/%s/execute"
+type Product struct {
+	ID    int64   `json:"id"`
+	Name  string  `json:"name"`
+	Info  string  `json:"info,omitempty"`
+	Price float64 `json:"price"`
+}
 
-//const serverAddress = "http://localhost:8081/agent/v1/%s/execute"
+type ErrorWithCode struct {
+	Message string
+	Code    string
+}
 
-var failedEndpints = make([]string, 0)
-var count = 1
+func (err *ErrorWithCode) Error() string {
+	return err.Message
+}
 
-type RequestBody struct {
-	Files     []string `json:"files"`
-	Endpoints []string `json:"endpoints"`
+func (err *ErrorWithCode) Extensions() map[string]interface{} {
+	return map[string]interface{}{
+		"code": err.Code,
+	}
+}
+
+var _ gqlerrors.ExtendedError = (*ErrorWithCode)(nil)
+
+var products []Product
+
+var productType = graphql.NewObject(
+	graphql.ObjectConfig{
+		Name: "Product",
+		Fields: graphql.Fields{
+			"id": &graphql.Field{
+				Type: graphql.Int,
+			},
+			"name": &graphql.Field{
+				Type: graphql.String,
+			},
+			"info": &graphql.Field{
+				Type: graphql.String,
+			},
+			"price": &graphql.Field{
+				Type: graphql.Float,
+			},
+		},
+	},
+)
+
+var queryType = graphql.NewObject(
+	graphql.ObjectConfig{
+		Name: "Query",
+		Fields: graphql.Fields{
+			/* Get (read) single product by id
+			   http://localhost:8080/product?query={product(id:1){name,info,price}}
+			*/
+			"product": &graphql.Field{
+				Type:        productType,
+				Description: "Get product by id",
+				Args: graphql.FieldConfigArgument{
+					"id": &graphql.ArgumentConfig{
+						Type: graphql.Int,
+					},
+				},
+				Resolve: func(p graphql.ResolveParams) (interface{}, error) {
+					id, ok := p.Args["id"].(int)
+					if ok {
+						// Find product
+						for _, product := range products {
+							if int(product.ID) == id {
+								return product, nil
+							}
+						}
+					}
+					return nil, nil
+				},
+			},
+			/* Get (read) product list
+			   http://localhost:8080/product?query={list{id,name,info,price}}
+			*/
+			"list": &graphql.Field{
+				Type:        graphql.NewList(productType),
+				Description: "Get product list",
+				Resolve: func(params graphql.ResolveParams) (interface{}, error) {
+					// Success response
+					// return products, nil
+
+					// Error response
+					// This is how you can throw errors with status codes, feel free to play around
+					return nil, &ErrorWithCode{"Could not connect to the Cassandra Cluster.", "CASSANDRA_CONNECTION_TIMEOUT"}
+
+					// This is how we are handling error messages in current rmm-graphql-api, feel free to play around
+					// return nil, errors.New("GenerateTokenMutationType HTTP POST Error: StatusCode")
+				},
+			},
+		},
+	})
+
+var mutationType = graphql.NewObject(graphql.ObjectConfig{
+	Name: "Mutation",
+	Fields: graphql.Fields{
+		/* Create new product item
+		http://localhost:8080/product?query=mutation+_{create(name:"Inca Kola",info:"Inca Kola is a soft drink that was created in Peru in 1935 by British immigrant Joseph Robinson Lindley using lemon verbena (wiki)",price:1.99){id,name,info,price}}
+		*/
+		"create": &graphql.Field{
+			Type:        productType,
+			Description: "Create new product",
+			Args: graphql.FieldConfigArgument{
+				"name": &graphql.ArgumentConfig{
+					Type: graphql.NewNonNull(graphql.String),
+				},
+				"info": &graphql.ArgumentConfig{
+					Type: graphql.String,
+				},
+				"price": &graphql.ArgumentConfig{
+					Type: graphql.NewNonNull(graphql.Float),
+				},
+			},
+			Resolve: func(params graphql.ResolveParams) (interface{}, error) {
+				rand.Seed(time.Now().UnixNano())
+				product := Product{
+					ID:    int64(rand.Intn(100000)), // generate random ID
+					Name:  params.Args["name"].(string),
+					Info:  params.Args["info"].(string),
+					Price: params.Args["price"].(float64),
+				}
+				products = append(products, product)
+				return product, nil
+			},
+		},
+
+		/* Update product by id
+		   http://localhost:8080/product?query=mutation+_{update(id:1,price:3.95){id,name,info,price}}
+		*/
+		"update": &graphql.Field{
+			Type:        productType,
+			Description: "Update product by id",
+			Args: graphql.FieldConfigArgument{
+				"id": &graphql.ArgumentConfig{
+					Type: graphql.NewNonNull(graphql.Int),
+				},
+				"name": &graphql.ArgumentConfig{
+					Type: graphql.String,
+				},
+				"info": &graphql.ArgumentConfig{
+					Type: graphql.String,
+				},
+				"price": &graphql.ArgumentConfig{
+					Type: graphql.Float,
+				},
+			},
+			Resolve: func(params graphql.ResolveParams) (interface{}, error) {
+				id, _ := params.Args["id"].(int)
+				name, nameOk := params.Args["name"].(string)
+				info, infoOk := params.Args["info"].(string)
+				price, priceOk := params.Args["price"].(float64)
+				product := Product{}
+				for i, p := range products {
+					if int64(id) == p.ID {
+						if nameOk {
+							products[i].Name = name
+						}
+						if infoOk {
+							products[i].Info = info
+						}
+						if priceOk {
+							products[i].Price = price
+						}
+						product = products[i]
+						break
+					}
+				}
+				return product, nil
+			},
+		},
+
+		/* Delete product by id
+		   http://localhost:8080/product?query=mutation+_{delete(id:1){id,name,info,price}}
+		*/
+		"delete": &graphql.Field{
+			Type:        productType,
+			Description: "Delete product by id",
+			Args: graphql.FieldConfigArgument{
+				"id": &graphql.ArgumentConfig{
+					Type: graphql.NewNonNull(graphql.Int),
+				},
+			},
+			Resolve: func(params graphql.ResolveParams) (interface{}, error) {
+				id, _ := params.Args["id"].(int)
+				product := Product{}
+				for i, p := range products {
+					if int64(id) == p.ID {
+						product = products[i]
+						// Remove from product list
+						products = append(products[:i], products[i+1:]...)
+					}
+				}
+
+				return product, nil
+			},
+		},
+	},
+})
+
+var schema, _ = graphql.NewSchema(
+	graphql.SchemaConfig{
+		Query:    queryType,
+		Mutation: mutationType,
+	},
+)
+
+func executeQuery(query string, schema graphql.Schema) *graphql.Result {
+	result := graphql.Do(graphql.Params{
+		Schema:        schema,
+		RequestString: query,
+	})
+	if len(result.Errors) > 0 {
+		fmt.Printf("errors: %v", result.Errors)
+	}
+	return result
+}
+
+func initProductsData(p *[]Product) {
+	product1 := Product{ID: 1, Name: "Chicha Morada", Info: "Chicha morada is a beverage originated in the Andean regions of Perú but is actually consumed at a national level (wiki)", Price: 7.99}
+	product2 := Product{ID: 2, Name: "Chicha de jora", Info: "Chicha de jora is a corn beer chicha prepared by germinating maize, extracting the malt sugars, boiling the wort, and fermenting it in large vessels (traditionally huge earthenware vats) for several days (wiki)", Price: 5.95}
+	product3 := Product{ID: 3, Name: "Pisco", Info: "Pisco is a colorless or yellowish-to-amber colored brandy produced in winemaking regions of Peru and Chile (wiki)", Price: 9.95}
+	*p = append(*p, product1, product2, product3)
 }
 
 func main() {
-	router := gin.Default()
-	router.POST("/upload-plugin/reterive-logs", func(c *gin.Context) {
+	// Primary data initialization
+	initProductsData(&products)
 
-		var loginCmd RequestBody
-		c.BindJSON(&loginCmd)
-
-		fmt.Println(loginCmd)
-
-		response := make([]string, 0)
-
-		response, _ = sendMessage(loginCmd.Endpoints, loginCmd.Files, response)
-
-		fmt.Println(response)
-
-		c.JSON(http.StatusOK, gin.H{"user": loginCmd})
-
+	h := handler.New(&handler.Config{
+		Schema:   &schema,
+		Pretty:   true,
+		GraphiQL: true,
 	})
-	router.Run(":8080")
-}
 
-func sendMessage(partial []string, files []string, resp []string) ([]string, error) { // SendMessage
-	for _, endpoint := range partial {
-		payload := createPayload(endpoint, files)
-		req, err := http.NewRequest("POST", fmt.Sprintf(serverAddress, endpoint), payload)
-		if err != nil {
-			fmt.Println(time.Now(), " Error while creating request ", err, " for endpoint ", endpoint)
-			failedEndpints = append(failedEndpints, endpoint)
-		}
-		req.Header.Add("content-type", "application/json")
-		req.Header.Add("cache-control", "no-cache")
-
-		res, err := createClient().Do(req)
-		if err != nil {
-			fmt.Println(time.Now(), " Error while geting response ", err, " for endpoint ", endpoint)
-			failedEndpints = append(failedEndpints, endpoint)
-		}
-		if res != nil && res.Body != nil {
-			defer res.Body.Close()
-			body, err := ioutil.ReadAll(res.Body)
-			if err != nil {
-				fmt.Println(time.Now(), " Error while Reading message ", err, " for endpoint ", endpoint)
-				failedEndpints = append(failedEndpints, endpoint)
-			}
-			resp = append(resp, string(body))
-		}
-	}
-	time.Sleep(10 * time.Second)
-	return resp, nil
-}
-
-func createPayload(endpoint string, files []string) io.Reader {
-	count++
-	uploadAddress := "https://agent.service.itsupport247.net"
-	message := "\t{\"requestID\":\"r" + strconv.Itoa(count) + "\", \"fileServerURL\":\"" + uploadAddress + "/agent/v1/" + endpoint + "/fileupload\", \"protocol\":\"HTTPS\", \"srcPath\":" + strings.Join(files, ",") + ", \"destPath\":\"\"}\r\n"
-	encodedString := base64.StdEncoding.EncodeToString([]byte(message))
-	payload := "{\n  \"name\": \"Agent Core Logs\",\n  \"type\": \"SCHEDULE\",\n  \"version\": \"2.0\",\n  \"timestampUTC\": \"2018-09-10T12:24:53.489110938Z\",\n  \"path\": \"/filetransfer/ftp/upload\",\n  \"message\": \"{\\\"task\\\": \\\"/schedule/filetransfer/ftp/upload\\\", \\\"executeNow\\\": \\\"true\\\", \\\"taskInput\\\":\\\"" + encodedString + "\\\"}\"\n}\n"
-	return strings.NewReader(payload)
-}
-
-func readEndpoints(path string) ([]string, error) {
-	value, err := ioutil.ReadFile(path)
-	if err != nil {
-		return []string{}, err
-	}
-
-	endpoints := strings.Replace(string(value), "\n", ",", -1)
-	endpoints = strings.Replace(string(value), "\r", ",", -1)
-	endpoints = strings.Replace(string(value), "\r\n", ",", -1)
-	endpoints = strings.Replace(string(value), " ", ",", -1)
-	re := regexp.MustCompile(`\r?\n`)
-	endpoints = re.ReplaceAllString(endpoints, ",")
-	return strings.Split(endpoints, ","), nil
-}
-
-var client *http.Client
-
-func createClient() *http.Client {
-	if client == nil {
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify:     true,
-			SessionTicketsDisabled: false,
-			ClientSessionCache:     tls.NewLRUClientSessionCache(1),
-		}
-
-		transport := &http.Transport{
-			TLSClientConfig: tlsConfig,
-			Proxy:           http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   3 * time.Second,
-				KeepAlive: 3 * time.Second,
-			}).DialContext,
-			MaxIdleConns:          1,
-			IdleConnTimeout:       time.Minute,
-			TLSHandshakeTimeout:   3 * time.Second,
-			ExpectContinueTimeout: 3 * time.Second,
-			MaxIdleConnsPerHost:   2,
-		}
-		client = &http.Client{
-			Timeout:   time.Minute,
-			Transport: transport,
-		}
-	}
-	return client
+	http.Handle("/graphql", h)
+	http.ListenAndServe(":8080", nil)
 }
