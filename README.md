@@ -9,6 +9,7 @@ github.com/graphql-go/handler
 ## Run the example
 ```
 go run main.go
+// visit http://localhost:8080/graphql
 ```
 
 
